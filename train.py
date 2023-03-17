@@ -1,147 +1,232 @@
+#    Copyright 2023 Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li
+#
+#    Licensed under the Apache License, Version 2.0 (the "License");
+#    you may not use this file except in compliance with the License.
+#    You may obtain a copy of the License at
+#
+#        http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS,
+#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#    See the License for the specific language governing permissions and
+#    limitations under the License.
+
+import copy
+import logging
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Sequence
+
 import torch
-import json
-import argparse
+import transformers
+from torch.utils.data import Dataset
+from transformers import Trainer
 
-from accelerate import init_empty_weights, infer_auto_device_map
-from transformers import AutoConfig
-from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
-from transformers import TrainingArguments
-import numpy as np
-import evaluate
+import utils
 
-from transformers import TrainingArguments, Trainer
-from transformers import AutoTokenizer
-from transformers import DataCollatorForLanguageModeling
-from joblib import Memory
-from loguru import logger
-from typing import List, Union
-
-from datasets import Dataset
-
-memory = Memory("./cache", verbose=0)
-
-
-def gen():
-    alpaca = json.load(open('alpaca_data.json', 'r'))
-    for i in alpaca:
-        yield i
+IGNORE_INDEX = -100
+DEFAULT_PAD_TOKEN = "[PAD]"
+DEFAULT_EOS_TOKEN = "</s>"
+DEFAULT_BOS_TOKEN = "</s>"
+DEFAULT_UNK_TOKEN = "</s>"
+PROMPT_DICT = {
+    "prompt_input": (
+        "Below is an instruction that describes a task, paired with an input that provides further context. "
+        "Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:"
+    ),
+    "prompt_no_input": (
+        "Below is an instruction that describes a task. "
+        "Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n{instruction}\n\n### Response:"
+    ),
+}
 
 
-@memory.cache
-def get_dataset():
-    ds = Dataset.from_generator(gen)
-    df = ds.to_pandas()
-    df['text'] = df['instruction'] + df['input'] + df['output']
-    del df['instruction']
-    del df['input']
-    del df['output']
-    ds = ds.from_pandas(df)
-
-    def tokenize_text(examples):
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-        return tokenizer(examples['text'], padding="max_length", truncation=True)
-
-    # ds = ds.map(tokenize_instruction, batched=True)
-    # ds = ds.map(tokenize_input, batched=True)
-    # ds = ds.map(tokenize_output, batched=True)
-    ds = ds.map(tokenize_text, batched=True, remove_columns=['text'])
-    block_size = 128
-
-    def group_texts(examples):
-        concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
-        total_length = len(concatenated_examples[list(examples.keys())[0]])
-        result = {
-            k: [t[i: i + block_size] for i in range(0, total_length, block_size)]
-            for k, t in concatenated_examples.items()
-        }
-        result["labels"] = result["input_ids"].copy()
-        return result
-
-    ds = ds.map(group_texts, batched=True)
-    ds = ds.train_test_split(test_size=0.1)  # to be investigated but a stratified split is probably better
-    return ds
+@dataclass
+class ModelArguments:
+    model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
 
 
-def get_device_map(model_name, device, do_int8):
-    #return "auto"
-    if device == "a100-40g":
-        return "auto"
+@dataclass
+class DataArguments:
+    data_path: str = field(default=None, metadata={"help": "Path to the training data."})
 
-    with init_empty_weights():
-        config = AutoConfig.from_pretrained(model_name)
-        model = AutoModelForCausalLM.from_config(config)
 
-    d = {}
-    for i in range(0, 4):
-        d[i] = "16GiB"
-
-    device_map = infer_auto_device_map(
-        model, max_memory=d, dtype=torch.int8 if do_int8 else torch.float16,
-        no_split_module_classes=["BloomBlock", "OPTDecoderLayer", "LLaMADecoderLayer"]
+@dataclass
+class TrainingArguments(transformers.TrainingArguments):
+    cache_dir: Optional[str] = field(default=None)
+    optim: str = field(default="adamw_torch")
+    model_max_length: int = field(
+        default=512,
+        metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
     )
-    del model
-    print(device_map)
-    return device_map
+
+
+def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
+    """Collects the state dict and dump to disk."""
+    state_dict = trainer.model.state_dict()
+    if trainer.args.should_save:
+        cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
+        del state_dict
+        trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
+
+
+def smart_tokenizer_and_embedding_resize(
+    special_tokens_dict: Dict,
+    tokenizer: transformers.PreTrainedTokenizer,
+    model: transformers.PreTrainedModel,
+):
+    """Resize tokenizer and embedding.
+
+    Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
+    """
+    num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
+    model.resize_token_embeddings(len(tokenizer))
+
+    if num_new_tokens > 0:
+        input_embeddings = model.get_input_embeddings().weight.data
+        output_embeddings = model.get_output_embeddings().weight.data
+
+        input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+        output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+
+        input_embeddings[-num_new_tokens:] = input_embeddings_avg
+        output_embeddings[-num_new_tokens:] = output_embeddings_avg
+
+
+def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedTokenizer) -> Dict:
+    """Tokenize a list of strings."""
+    tokenized_list = [
+        tokenizer(
+            text,
+            return_tensors="pt",
+            padding="longest",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+        )
+        for text in strings
+    ]
+    input_ids = labels = [tokenized.input_ids[0] for tokenized in tokenized_list]
+    input_ids_lens = labels_lens = [
+        tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item() for tokenized in tokenized_list
+    ]
+    return dict(
+        input_ids=input_ids,
+        labels=labels,
+        input_ids_lens=input_ids_lens,
+        labels_lens=labels_lens,
+    )
+
+
+def preprocess(
+    sources: Sequence[str],
+    targets: Sequence[str],
+    tokenizer: transformers.PreTrainedTokenizer,
+) -> Dict:
+    """Preprocess the data by tokenizing."""
+    examples = [s + t for s, t in zip(sources, targets)]
+    examples_tokenized, sources_tokenized = [_tokenize_fn(strings, tokenizer) for strings in (examples, sources)]
+    input_ids = examples_tokenized["input_ids"]
+    labels = copy.deepcopy(input_ids)
+    for label, source_len in zip(labels, sources_tokenized["input_ids_lens"]):
+        label[:source_len] = IGNORE_INDEX
+    return dict(input_ids=input_ids, labels=labels)
+
+
+class SupervisedDataset(Dataset):
+    """Dataset for supervised fine-tuning."""
+
+    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer):
+        super(SupervisedDataset, self).__init__()
+        logging.warning("Loading data...")
+        list_data_dict = utils.jload(data_path)
+
+        logging.warning("Formatting inputs...")
+        prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
+        sources = [
+            prompt_input.format_map(example) if example.get("input", "") != "" else prompt_no_input.format_map(example)
+            for example in list_data_dict
+        ]
+        targets = [f"{example['output']}{tokenizer.eos_token}" for example in list_data_dict]
+
+        logging.warning("Tokenizing inputs... This may take some time...")
+        data_dict = preprocess(sources, targets, tokenizer)
+
+        self.input_ids = data_dict["input_ids"]
+        self.labels = data_dict["labels"]
+
+    def __len__(self):
+        return len(self.input_ids)
+
+    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+        return dict(input_ids=self.input_ids[i], labels=self.labels[i])
+
+
+@dataclass
+class DataCollatorForSupervisedDataset(object):
+    """Collate examples for supervised fine-tuning."""
+
+    tokenizer: transformers.PreTrainedTokenizer
+
+    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+        )
+        labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+        return dict(
+            input_ids=input_ids,
+            labels=labels,
+            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
+        )
+
+
+def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
+    """Make dataset and collator for supervised fine-tuning."""
+    train_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path)
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+
+
+def train():
+    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
+    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    model = transformers.AutoModelForCausalLM.from_pretrained(
+        model_args.model_name_or_path,
+        cache_dir=training_args.cache_dir,
+    )
+
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        model_args.model_name_or_path,
+        cache_dir=training_args.cache_dir,
+        model_max_length=training_args.model_max_length,
+        padding_side="right",
+        use_fast=False,
+    )
+    if tokenizer.pad_token is None:
+        smart_tokenizer_and_embedding_resize(
+            special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
+            tokenizer=tokenizer,
+            model=model,
+        )
+    if "llama" in model_args.model_name_or_path:
+        tokenizer.add_special_tokens(
+            {
+                "eos_token": DEFAULT_EOS_TOKEN,
+                "bos_token": DEFAULT_BOS_TOKEN,
+                "unk_token": DEFAULT_UNK_TOKEN,
+            }
+        )
+
+    data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+    trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    trainer.train()
+    trainer.save_state()
+    safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, default="/data/llama/hf/")
-    parser.add_argument("--variant", type=str, default="7b", choices=["7b", "13b", "33b", "65b"])
-    parser.add_argument(
-        "--device", type=str, default="a5000-18g"
-        # choices=["a100-40g", "v100-32g", "a5000-24g", "a5000-20g"], default="a5000-24g"
-    )
-    args = parser.parse_args()
+    train()
 
-    model_id = f"{args.model_path}/llama-{args.variant}"
-
-    tokenizer = AutoTokenizer.from_pretrained(f"{args.model_path}/tokenizer/", model_max_length=512, truncation=True)
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-
-    model = AutoModelForCausalLM.from_pretrained(model_id,
-                                                 device_map=get_device_map(model_id, args.device, False),
-                                                 low_cpu_mem_usage=True)
-    # device_map=get_device_map(model_id, args.device, False),
-    # torch_dtype=torch.int8 if args.do_int8 else torch.float16,
-    # torch_dtype=torch.float16,
-
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-
-
-    # tokenizer = AutoTokenizer.from_pretrained("bert-base-cased")
-
-    def tokenize_function(examples, field):
-        return tokenizer(examples[field], padding="max_length", truncation=True)
-
-
-    def tokenize_instruction(examples):
-        return tokenize_function(examples, "instruction")
-
-
-    def tokenize_input(examples):
-        return tokenize_function(examples, "input")
-
-
-    def tokenize_output(examples):
-        return tokenize_function(examples, "output")
-
-
-    ds = get_dataset()
-    training_args = TrainingArguments(output_dir="trainer",
-                                      per_device_train_batch_size=128,
-                                      learning_rate=2e-5,
-                                      num_train_epochs=3,
-                                      weight_decay=1,
-                                      evaluation_strategy="epoch")
-
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=ds["train"],
-        eval_dataset=ds["test"]
-    )
-
-    trainer.train()

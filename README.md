@@ -3,15 +3,16 @@
 <a href="https://crfm.stanford.edu/alpaca/" target="_blank"><img src="assets/logo.png" alt="Stanford-Alpaca" style="width: 50%; min-width: 300px; display: block; margin: auto;"></a>
 </p>
 
-# Stanford Alpaca: An Instruction-following LLaMA model 
+# Stanford Alpaca: An Instruction-following LLaMA Model 
 [![License](https://img.shields.io/badge/License-Apache_2.0-green.svg)](https://github.com/tatsu-lab/stanford_alpaca/blob/main/LICENSE) 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/release/python-380/) 
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/release/python-390/) 
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black) 
 
 This is the repo for the Stanford Alpaca project, which aims to build and share an instruction-following LLaMA model. The repo contains:
 - A [**web demo**](https://crfm.stanford.edu/alpaca/) to interact with our Alpaca model
 - The [52K data](#data-release) used for fine-tuning the model
 - The code for [generating the data](#data-generation-process)
+- The code for [fine-tuning the model](#fine-tuning)
 
 ## Overview
 
@@ -24,7 +25,7 @@ We thus encourage users to be cautious when interacting with Alpaca, and to repo
 
 Our initial release contains the data generation procedure, dataset, and training recipe. We intend to release the model weights if we are given permission to do so by the creators of LLaMA. For now, we have chosen to host a live demo to help readers better understand the capabilities and limits of Alpaca, as well as a way to help us better evaluate Alpaca's performance on a broader audience.
 
-**Please read our release [blog post](https://crfm.stanford.edu/2023/03/13/alpaca.html) for more details about the model, our discussion of the potential harm and limitations of Alpaca models, and our thought process of an open-source release.**
+**Please read our release [blog post](https://crfm.stanford.edu/2023/03/13/alpaca.html) for more details about the model, our discussion of the potential harm and limitations of Alpaca models, and our thought process for releasing a reproducible model.**
 
 
 [1]: LLaMA: Open and Efficient Foundation Language Models. Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, Aurelien Rodriguez, Armand Joulin, Edouard Grave, Guillaume Lample. https://arxiv.org/abs/2302.13971v1
@@ -61,6 +62,8 @@ We used the following prompts for fine-tuning the Alpaca model:
  
  ### Response:
  ```
+ 
+ During inference (eg for the web demo), we use the user instruction with an empty input field (second option).
 
 ## Data Generation Process
 
@@ -75,7 +78,7 @@ We used the following prompts for fine-tuning the Alpaca model:
 
 We built on the data generation pipeline from [self-instruct](https://github.com/yizhongw/self-instruct) and made the following modifications:
 - We used `text-davinci-003` to generate the instruction data instead of `davinci`.
-- We wrote a new prompt (`prompt.txt`) that explicitly gave the requirement of instruction generation to `text-davinci-003`.
+- We wrote a new prompt (`prompt.txt`) that explicitly gave the requirement of instruction generation to `text-davinci-003`. Note: there is a slight error in the prompt we used, and future users should incorporate the edit in https://github.com/tatsu-lab/stanford_alpaca/pull/24
 - We adopted much more aggressive batch decoding, i.e., generating 20 instructions at once, which significantly reduced the cost of data generation.
 - We simplified the data generation pipeline by discarding the difference between classification and non-classification instructions.
 - We only generated a single instance for each instruction, instead of 2 to 3 instances as in [1].
@@ -89,7 +92,7 @@ The inner circle of the plot represents the root verb of the instructions, and t
 [<img src="assets/parse_analysis.png" width="750" />](./assets/parse_analysis.png)
 
 ## Fine-tuning
-We fine-tune our model using standard huggingface training code with the following hyperparameters:
+We fine-tune our models using standard Hugging Face training code with the following hyperparameters:
 
 | Hyperparameter | Value |
 |----------------|-------|
@@ -97,9 +100,83 @@ We fine-tune our model using standard huggingface training code with the followi
 | Learning rate  | 2e-5  |
 | Epochs         | 3     |
 | Max length     | 512   |
- | Weight decay   | 1     |
+ | Weight decay   | 0     |
 
-We are waiting for huggingface to officially support the llama models (i.e. this [PR](https://github.com/huggingface/transformers/pull/21955) to be merged) before we release a stable version of the finetuning code.
+Given Hugging Face hasn't officially supported the LLaMA models, we fine-tuned LLaMA with Hugging Face's transformers library by installing it from a particular fork (i.e. this [PR](https://github.com/huggingface/transformers/pull/21955) to be merged).
+The hash of the specific commit we installed was `68d640f7c368bcaaaecfc678f11908ebbd3d6176`.
+
+To reproduce our fine-tuning runs for LLaMA, first install the requirements 
+```bash
+pip install -r requirements.txt
+```
+Then, install the particular fork of Hugging Face's transformers library.
+
+Below is a command that fine-tunes LLaMA-7B with our dataset on a machine with 4 A100 80G GPUs in FSDP `full_shard` mode. 
+We were able to reproduce a model of similar quality as the one we hosted in our demo with the following command using **Python 3.10**.
+Replace `<your_random_port>` with a port of your own, `<your_path_to_hf_converted_llama_ckpt_and_tokenizer>` with the 
+path to your converted checkpoint and tokenizer (following instructions in the PR), and `<your_output_dir>` with where you want to store your outputs.
+
+```bash
+torchrun --nproc_per_node=4 --master_port=<your_random_port> train.py \
+    --model_name_or_path <your_path_to_hf_converted_llama_ckpt_and_tokenizer> \
+    --data_path ./alpaca_data.json \
+    --bf16 True \
+    --output_dir <your_output_dir> \
+    --num_train_epochs 3 \
+    --per_device_train_batch_size 4 \
+    --per_device_eval_batch_size 4 \
+    --gradient_accumulation_steps 8 \
+    --evaluation_strategy "no" \
+    --save_strategy "steps" \
+    --save_steps 2000 \
+    --save_total_limit 1 \
+    --learning_rate 2e-5 \
+    --weight_decay 0. \
+    --warmup_ratio 0.03 \
+    --lr_scheduler_type "cosine" \
+    --logging_steps 1 \
+    --fsdp "full_shard auto_wrap" \
+    --fsdp_transformer_layer_cls_to_wrap 'LLaMADecoderLayer' \
+    --tf32 True
+```
+
+### Warning
+`fsdp_transformer_layer_cls_to_wrap` must be set to the name of the specific decoder layer. 
+The LLaMA Hugging Face PR is not stable. 
+Earlier commits used the name `LLaMADecoderLayer` for their decoder layer (the commit hash our code is based on this). 
+More recent commits use `LlamaDecoderLayer` (notice the small case difference).
+Not setting `fsdp_transformer_layer_cls_to_wrap` to the correct name will lead to drastic slowdowns in training.
+
+### Side notes
+
+The same script also works for OPT fine-tuning. Here's an example for fine-tuning OPT-6.7B
+
+```bash
+torchrun --nproc_per_node=4 --master_port=<your_random_port> train.py \
+    --model_name_or_path "facebook/opt-6.7b" \
+    --data_path ./alpaca_data.json \
+    --bf16 True \
+    --output_dir <your_output_dir> \
+    --num_train_epochs 3 \
+    --per_device_train_batch_size 4 \
+    --per_device_eval_batch_size 4 \
+    --gradient_accumulation_steps 8 \
+    --evaluation_strategy "no" \
+    --save_strategy "steps" \
+    --save_steps 2000 \
+    --save_total_limit 1 \
+    --learning_rate 2e-5 \
+    --weight_decay 0. \
+    --warmup_ratio 0.03 \
+    --lr_scheduler_type "cosine" \
+    --logging_steps 1 \
+    --fsdp "full_shard auto_wrap" \
+    --fsdp_transformer_layer_cls_to_wrap 'OPTDecoderLayer' \
+    --tf32 True
+```
+
+Note the given training script is meant to be simple and easy to use, and is not particularly optimized.
+To run on more gpus, you may prefer to turn down `gradient_accumulation_steps` to keep a global batch size of 128. Global batch size has not been tested for optimality.
 
 ### Authors
 All grad students below contributed equally and the order is determined by random draw.
@@ -131,3 +208,4 @@ Naturally, you should also cite the original LLaMA paper [1] and the Self-Instru
 ### Acknowledgements
 
 We thank Yizhong Wang for his help in explaining the data generation pipeline in Self-Instruct and providing the code for the parse analysis plot.
+We thank Yifan Mai for helpful support, and members of the Stanford NLP Group as well as the Center for Research on Foundation Models (CRFM) for their helpful feedback.
