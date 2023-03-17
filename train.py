@@ -8,17 +8,19 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 from transformers import TrainingArguments
 import numpy as np
 import evaluate
-
+import transformers
 from transformers import TrainingArguments, Trainer
 from transformers import AutoTokenizer
 from transformers import DataCollatorForLanguageModeling
 from joblib import Memory
 from loguru import logger
 from typing import List, Union
-
+from typing import Tuple
 from datasets import Dataset
+from accelerate import Accelerator
 
 memory = Memory("./cache", verbose=0)
+
 
 
 def gen():
@@ -37,6 +39,12 @@ def get_dataset():
     del df['output']
     ds = ds.from_pandas(df)
 
+    with open('alpaca_data.txt', 'w') as f:
+        for i in gen():
+            text = i['instruction'] + " " + i['input'] + " " + i['output']
+            text = text.replace('\n', ' ')
+            f.write(text + "\n")
+
     def tokenize_text(examples):
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.add_special_tokens({'pad_token': '[PAD]'})
@@ -46,7 +54,8 @@ def get_dataset():
     # ds = ds.map(tokenize_input, batched=True)
     # ds = ds.map(tokenize_output, batched=True)
     ds = ds.map(tokenize_text, batched=True, remove_columns=['text'])
-    block_size = 128
+
+    block_size = 64
 
     def group_texts(examples):
         concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
@@ -63,70 +72,48 @@ def get_dataset():
     return ds
 
 
-def get_device_map(model_name, device, do_int8):
-    #return "auto"
-    if device == "a100-40g":
-        return "auto"
-
-    with init_empty_weights():
-        config = AutoConfig.from_pretrained(model_name)
-        model = AutoModelForCausalLM.from_config(config)
-
-    d = {}
-    for i in range(0, 4):
-        d[i] = "16GiB"
-
-    device_map = infer_auto_device_map(
-        model, max_memory=d, dtype=torch.int8 if do_int8 else torch.float16,
-        no_split_module_classes=["BloomBlock", "OPTDecoderLayer", "LLaMADecoderLayer"]
-    )
-    del model
-    print(device_map)
-    return device_map
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, default="/data/llama/hf/")
     parser.add_argument("--variant", type=str, default="7b", choices=["7b", "13b", "33b", "65b"])
-    parser.add_argument(
-        "--device", type=str, default="a5000-18g"
-        # choices=["a100-40g", "v100-32g", "a5000-24g", "a5000-20g"], default="a5000-24g"
-    )
+
     args = parser.parse_args()
 
     model_id = f"{args.model_path}/llama-{args.variant}"
-
-    tokenizer = AutoTokenizer.from_pretrained(f"{args.model_path}/tokenizer/", model_max_length=512, truncation=True)
+    print("model_id", model_id)
+    tokenizer = transformers.LLaMATokenizer.from_pretrained(f"{args.model_path}/tokenizer/",
+                                                            model_max_length=512,
+                                                            truncation=True)
+    model = transformers.LLaMAForCausalLM.from_pretrained(model_id, max_sequence_length=512, low_cpu_mem_usage=True)
+    print("Model loaded")
+    #model = AutoModelForCausalLM.from_pretrained(model_id, low_cpu_mem_usage=True)
+    #tokenizer = AutoTokenizer.from_pretrained(f"{args.model_path}/tokenizer/", model_max_length=512, truncation=True)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 
-    model = AutoModelForCausalLM.from_pretrained(model_id,
-                                                 device_map=get_device_map(model_id, args.device, False),
-                                                 low_cpu_mem_usage=True)
     # device_map=get_device_map(model_id, args.device, False),
     # torch_dtype=torch.int8 if args.do_int8 else torch.float16,
     # torch_dtype=torch.float16,
 
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-
     # tokenizer = AutoTokenizer.from_pretrained("bert-base-cased")
 
-    def tokenize_function(examples, field):
-        return tokenizer(examples[field], padding="max_length", truncation=True)
-
-
-    def tokenize_instruction(examples):
-        return tokenize_function(examples, "instruction")
-
-
-    def tokenize_input(examples):
-        return tokenize_function(examples, "input")
-
-
-    def tokenize_output(examples):
-        return tokenize_function(examples, "output")
+    # def tokenize_function(examples, field):
+    #     return tokenizer(examples[field], padding="max_length", truncation=True)
+    #
+    #
+    # def tokenize_instruction(examples):
+    #     return tokenize_function(examples, "instruction")
+    #
+    #
+    # def tokenize_input(examples):
+    #     return tokenize_function(examples, "input")
+    #
+    #
+    # def tokenize_output(examples):
+    #     return tokenize_function(examples, "output")
 
 
     ds = get_dataset()
@@ -137,11 +124,34 @@ if __name__ == "__main__":
                                       weight_decay=1,
                                       evaluation_strategy="epoch")
 
+    training_args = TrainingArguments(bf16=True,
+                                      output_dir="trainer",
+                                      num_train_epochs=3,
+                                      per_device_train_batch_size=1,
+                                      per_device_eval_batch_size=1,
+                                      gradient_accumulation_steps=8,
+                                      evaluation_strategy="no",
+                                      save_strategy="steps",
+                                      save_steps=2000,
+                                      save_total_limit=1,
+                                      learning_rate=2e-5,
+                                      weight_decay=0.,
+                                      warmup_ratio=0.03,
+                                      lr_scheduler_type="cosine",
+                                      logging_steps=1,
+                                      fsdp="full_shard auto_wrap",
+                                      fsdp_transformer_layer_cls_to_wrap="LLaMADecoderLayer",
+                                      tf32=True
+                                      )
+
+    print(model.config)
+    #print(model)
+    #print(training_args)
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=ds["train"],
-        eval_dataset=ds["test"]
+        train_dataset=ds["train"].shuffle(seed=42).select(range(10)),
+        eval_dataset=ds["test"].shuffle(seed=42).select(range(10))
     )
 
     trainer.train()
